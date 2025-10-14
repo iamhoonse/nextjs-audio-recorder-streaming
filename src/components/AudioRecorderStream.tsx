@@ -9,6 +9,7 @@ export default function AudioRecorderStream() {
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const streamControllerRef = useRef<ReadableStreamDefaultController | null>(null);
+  const chunkBufferRef = useRef<Uint8Array[]>([]);
 
   // 브라우저가 ReadableStream body를 지원하는지 확인
   const checkSupport = async () => {
@@ -44,11 +45,23 @@ export default function AudioRecorderStream() {
 
       mediaRecorderRef.current = mediaRecorder;
 
+      // 버퍼 초기화
+      chunkBufferRef.current = [];
+
       // ReadableStream 생성
       const readableStream = new ReadableStream({
         start(controller) {
           streamControllerRef.current = controller;
           console.log('Stream started');
+
+          // 버퍼에 쌓인 청크들을 먼저 전송
+          if (chunkBufferRef.current.length > 0) {
+            console.log(`Flushing ${chunkBufferRef.current.length} buffered chunks`);
+            chunkBufferRef.current.forEach(chunk => {
+              controller.enqueue(chunk);
+            });
+            chunkBufferRef.current = [];
+          }
         },
         cancel() {
           console.log('Stream cancelled');
@@ -58,20 +71,26 @@ export default function AudioRecorderStream() {
       // 오디오 청크가 준비될 때마다 스트림에 추가
       let chunkCount = 0;
       mediaRecorder.ondataavailable = async (event) => {
-        if (event.data.size > 0 && streamControllerRef.current) {
+        if (event.data.size > 0) {
           try {
             // Blob을 ArrayBuffer로 변환
             const arrayBuffer = await event.data.arrayBuffer();
             const uint8Array = new Uint8Array(arrayBuffer);
 
-            // 스트림에 청크 추가
-            streamControllerRef.current.enqueue(uint8Array);
-            chunkCount++;
+            // 스트림 컨트롤러가 준비되었으면 바로 전송, 아니면 버퍼에 저장
+            if (streamControllerRef.current) {
+              streamControllerRef.current.enqueue(uint8Array);
+              console.log(`Chunk ${chunkCount} enqueued: ${uint8Array.length} bytes`);
+            } else {
+              chunkBufferRef.current.push(uint8Array);
+              console.log(`Chunk ${chunkCount} buffered: ${uint8Array.length} bytes`);
+            }
 
-            console.log(`Chunk ${chunkCount} enqueued: ${uint8Array.length} bytes`);
-            setStatus(`Recording... Chunk ${chunkCount} sent (${uint8Array.length} bytes)`);
+            chunkCount++;
+            setStatus(`Recording... Chunk ${chunkCount} processed (${uint8Array.length} bytes)`);
           } catch (error) {
-            console.error('Error enqueuing chunk:', error);
+            console.error('Error processing chunk:', error);
+            setStatus(`❌ Error processing chunk ${chunkCount}`);
           }
         }
       };
@@ -90,8 +109,11 @@ export default function AudioRecorderStream() {
           streamControllerRef.current = null;
         }
 
+        // 버퍼 클리어
+        chunkBufferRef.current = [];
+
         mediaStream.getTracks().forEach((track) => track.stop());
-        setStatus(`Recording stopped. Total chunks sent: ${chunkCount}`);
+        setStatus(`Recording stopped. Total chunks processed: ${chunkCount}`);
       };
 
       // Fetch로 스트림 전송 시작
