@@ -1,36 +1,215 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Next.js Audio Recorder Streaming
 
-## Getting Started
+Real-time audio recording with HTTP streaming using MediaRecorder API and Next.js.
 
-First, run the development server:
+## Features
+
+This project demonstrates **two different approaches** for streaming audio from the browser to the server:
+
+### Method 1: Individual POST Requests (Recommended for Development)
+- ✅ Works in all modern browsers
+- ✅ Simple and reliable implementation
+- ✅ No special server setup required
+- Uses separate HTTP POST for each audio chunk
+
+### Method 2: ReadableStream Body (Advanced)
+- ✅ True HTTP streaming with single connection
+- ✅ Lower overhead
+- ⚠️ Requires Chrome 95+ or compatible browser
+- ⚠️ Requires HTTP/2 (HTTPS)
+- Uses Fetch API with ReadableStream request body
+
+## Quick Start
+
+### Option A: Standard Development (HTTP/1.1)
 
 ```bash
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open [http://localhost:3000](http://localhost:3000) with your browser.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+**Method 1** (Individual POST) will work perfectly. **Method 2** (ReadableStream) will show an error because HTTP/2 is not available.
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+### Option B: Docker with HTTP/2 Support (Recommended for Testing Method 2)
+
+#### Prerequisites
+- Docker and Docker Compose installed
+- OpenSSL (for generating SSL certificates)
+
+#### Setup
+
+1. **Generate SSL certificates:**
+   ```bash
+   ./generate-ssl-cert.sh
+   ```
+
+2. **Start the Docker services:**
+   ```bash
+   docker-compose up
+   ```
+
+3. **Access the application:**
+   - Open [https://localhost](https://localhost) in your browser
+   - You'll see a security warning (expected for self-signed certificates)
+   - Click "Advanced" → "Proceed to localhost"
+
+4. **Test both methods:**
+   - Method 1 works as usual
+   - Method 2 now works with HTTP/2!
+
+#### Docker Architecture
+
+```
+Browser (HTTPS/HTTP2)
+    ↓
+NGINX (Port 443, SSL/TLS termination, HTTP/2)
+    ↓
+Next.js App (Port 3000, HTTP/1.1)
+```
+
+## Project Structure
+
+```
+.
+├── src/
+│   ├── app/
+│   │   ├── api/
+│   │   │   ├── audio-stream/route.ts          # Method 1: Individual POST handler
+│   │   │   └── audio-stream-readable/route.ts # Method 2: ReadableStream handler
+│   │   └── page.tsx                            # Main page with both methods
+│   └── components/
+│       ├── AudioRecorder.tsx                   # Method 1: Individual POST
+│       └── AudioRecorderStream.tsx             # Method 2: ReadableStream
+├── nginx/
+│   ├── nginx.conf                              # NGINX config with HTTP/2
+│   └── ssl/                                    # SSL certificates (generated)
+├── Dockerfile                                  # Next.js container
+├── docker-compose.yml                          # Docker orchestration
+└── generate-ssl-cert.sh                        # SSL cert generation script
+```
+
+## How It Works
+
+### Method 1: Individual POST Requests
+
+1. MediaRecorder captures audio in 1-second chunks
+2. Each chunk is sent via separate `fetch()` POST request
+3. Server receives and processes each chunk independently
+4. Works with standard HTTP/1.1
+
+**src/components/AudioRecorder.tsx:72**
+```typescript
+const response = await fetch('/api/audio-stream', {
+  method: 'POST',
+  body: formData, // Each chunk sent separately
+});
+```
+
+### Method 2: ReadableStream Body
+
+1. MediaRecorder captures audio in 1-second chunks
+2. Chunks are enqueued into a ReadableStream
+3. Single `fetch()` request with stream as body
+4. Server reads from stream continuously
+5. Requires HTTP/2 (HTTPS)
+
+**src/components/AudioRecorderStream.tsx:100**
+```typescript
+const readableStream = new ReadableStream({
+  start(controller) {
+    // MediaRecorder chunks are enqueued here
+    controller.enqueue(audioChunkData);
+  }
+});
+
+fetch('/api/audio-stream-readable', {
+  method: 'POST',
+  body: readableStream, // Single request, continuous stream
+  duplex: 'half',
+});
+```
+
+## Troubleshooting
+
+### ERR_ALPN_NEGOTIATION_FAILED
+
+This error occurs when trying Method 2 without HTTP/2 support.
+
+**Solution:** Use Docker setup (`docker-compose up`) and access via `https://localhost`
+
+### Certificate Error in Browser
+
+When using Docker, you'll see "Your connection is not private" because we use self-signed certificates.
+
+**Solution:** Click "Advanced" → "Proceed to localhost (unsafe)" - this is safe for local development.
+
+### Method 2 Not Working in Docker
+
+Make sure:
+1. SSL certificates are generated: `./generate-ssl-cert.sh`
+2. Docker containers are running: `docker-compose up`
+3. Accessing via HTTPS: `https://localhost` (not `http://`)
+4. Using Chrome 95+ or compatible browser
+
+### Port Already in Use
+
+If port 3000, 80, or 443 is already in use:
+
+```bash
+# Stop Docker containers
+docker-compose down
+
+# Or change ports in docker-compose.yml
+```
+
+## Technical Details
+
+### Browser Support
+
+| Feature | Chrome | Firefox | Safari | Edge |
+|---------|--------|---------|--------|------|
+| Method 1 (Individual POST) | ✅ All versions | ✅ All versions | ✅ All versions | ✅ All versions |
+| Method 2 (ReadableStream) | ✅ 95+ | ❌ Not yet | ❌ Not yet | ✅ 95+ |
+
+### Server Implementation
+
+Audio chunks are saved in the `uploads/` directory:
+- Method 1: `uploads/session_*/chunk_*.webm`
+- Method 2: `uploads/session_*/chunk_*.webm` + `full_audio.webm`
+
+You can modify the server handlers to:
+- Stream to Speech-to-Text APIs
+- Process audio in real-time
+- Forward to other services
+- Save in different formats
+
+## Production Deployment
+
+### Vercel / Netlify (HTTP/2 Native)
+
+Both methods work automatically in production on platforms that support HTTP/2:
+
+```bash
+npm run build
+# Deploy to Vercel
+```
+
+### Custom Server
+
+Ensure your reverse proxy (NGINX, Caddy, etc.) has:
+- HTTP/2 enabled
+- SSL/TLS configured
+- Request buffering disabled for `/api/audio-stream-readable`
 
 ## Learn More
 
-To learn more about Next.js, take a look at the following resources:
+- [MediaRecorder API](https://developer.mozilla.org/en-US/docs/Web/API/MediaRecorder)
+- [Fetch Streaming Uploads](https://web.dev/articles/fetch-upload-streaming)
+- [Next.js Documentation](https://nextjs.org/docs)
+- [HTTP/2 Overview](https://developers.google.com/web/fundamentals/performance/http2)
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## License
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+MIT

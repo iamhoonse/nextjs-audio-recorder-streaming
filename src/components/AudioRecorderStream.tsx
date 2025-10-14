@@ -106,14 +106,29 @@ export default function AudioRecorderStream() {
         // @ts-ignore - duplex는 아직 TypeScript에서 완전히 지원되지 않음
         duplex: 'half',
       })
-        .then(response => response.json())
+        .then(response => {
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+          }
+          return response.json();
+        })
         .then(data => {
           console.log('Upload complete:', data);
           setStatus(`✅ Upload complete! Session: ${data.sessionId}, Chunks: ${data.totalChunks}`);
         })
         .catch(error => {
           console.error('Upload error:', error);
-          setStatus(`❌ Upload error: ${error.message}`);
+
+          // 특정 에러에 대한 사용자 친화적 메시지
+          let errorMessage = error.message;
+
+          if (error.message.includes('ERR_ALPN_NEGOTIATION_FAILED')) {
+            errorMessage = 'HTTP/2 not available. Please use Docker setup (docker-compose up) or use Method 1.';
+          } else if (error.message.includes('Failed to fetch')) {
+            errorMessage = 'Network error. Make sure you are using HTTPS (https://localhost) with Docker.';
+          }
+
+          setStatus(`❌ Error: ${errorMessage}`);
         });
 
       // 1초마다 청크 생성
@@ -192,9 +207,15 @@ export default function AudioRecorderStream() {
         <p className="font-semibold mb-1">How it works:</p>
         <p>Uses Fetch API with ReadableStream body to send audio chunks</p>
         <p>in real-time without waiting for the recording to finish.</p>
-        <p className="mt-2 text-red-600">
-          Note: Requires Chrome 95+ or compatible browser
-        </p>
+        <div className="mt-3 p-3 bg-amber-50 border border-amber-200 rounded text-amber-800">
+          <p className="font-semibold mb-1">⚠️ Requirements:</p>
+          <ul className="list-disc list-inside text-left space-y-1">
+            <li>Chrome 95+ or compatible browser</li>
+            <li>HTTP/2 protocol (HTTPS required)</li>
+            <li>Use Docker setup: <code className="bg-amber-100 px-1 rounded">docker-compose up</code></li>
+            <li>Access via: <code className="bg-amber-100 px-1 rounded">https://localhost</code></li>
+          </ul>
+        </div>
       </div>
     </div>
   );
