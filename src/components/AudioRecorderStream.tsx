@@ -2,10 +2,23 @@
 
 import { useState, useRef } from 'react';
 
+interface ResponseChunk {
+  type: 'chunk' | 'complete' | 'error';
+  chunkIndex?: number;
+  bytes?: number;
+  totalBytes?: number;
+  sessionId?: string;
+  totalChunks?: number;
+  message?: string;
+  error?: string;
+}
+
 export default function AudioRecorderStream() {
   const [isRecording, setIsRecording] = useState(false);
   const [status, setStatus] = useState('Ready to record');
   const [isSupported, setIsSupported] = useState<boolean | null>(null);
+  const [uploadStatus, setUploadStatus] = useState<string>('');
+  const [receivedChunks, setReceivedChunks] = useState<ResponseChunk[]>([]);
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const streamControllerRef = useRef<ReadableStreamDefaultController | null>(null);
@@ -118,6 +131,8 @@ export default function AudioRecorderStream() {
 
       // Fetch로 스트림 전송 시작
       setStatus('Starting stream upload...');
+      setReceivedChunks([]);
+      setUploadStatus('Connecting to server...');
 
       fetch('/api/audio-stream-readable', {
         method: 'POST',
@@ -128,15 +143,62 @@ export default function AudioRecorderStream() {
         // @ts-ignore - duplex는 아직 TypeScript에서 완전히 지원되지 않음
         duplex: 'half',
       })
-        .then(response => {
+        .then(async response => {
           if (!response.ok) {
             throw new Error(`HTTP ${response.status}: ${response.statusText}`);
           }
-          return response.json();
-        })
-        .then(data => {
-          console.log('Upload complete:', data);
-          setStatus(`✅ Upload complete! Session: ${data.sessionId}, Chunks: ${data.totalChunks}`);
+
+          // 응답 스트림 읽기
+          const reader = response.body?.getReader();
+          if (!reader) {
+            throw new Error('No response stream');
+          }
+
+          const decoder = new TextDecoder();
+          let buffer = '';
+
+          setUploadStatus('Receiving response stream...');
+
+          while (true) {
+            const { done, value } = await reader.read();
+
+            if (done) {
+              console.log('Response stream complete');
+              setUploadStatus('Response stream closed');
+              break;
+            }
+
+            // 받은 데이터를 디코드하여 버퍼에 추가
+            buffer += decoder.decode(value, { stream: true });
+
+            // 줄바꿈으로 구분된 JSON 객체들을 파싱
+            const lines = buffer.split('\n');
+            // 마지막 요소는 불완전할 수 있으므로 버퍼에 유지
+            buffer = lines.pop() || '';
+
+            for (const line of lines) {
+              if (line.trim()) {
+                try {
+                  const data: ResponseChunk = JSON.parse(line);
+
+                  setReceivedChunks(prev => [...prev, data]);
+
+                  if (data.type === 'chunk') {
+                    setUploadStatus(
+                      `Received server response for chunk ${data.chunkIndex}: ${data.bytes} bytes (total: ${data.totalBytes} bytes)`
+                    );
+                  } else if (data.type === 'complete') {
+                    setUploadStatus(`✅ Complete! Session: ${data.sessionId}, Total chunks: ${data.totalChunks}`);
+                    setStatus(`✅ Upload complete! Session: ${data.sessionId}, Chunks: ${data.totalChunks}`);
+                  } else if (data.type === 'error') {
+                    setUploadStatus(`❌ Server error: ${data.error}`);
+                  }
+                } catch (error) {
+                  console.error('Error parsing response line:', line, error);
+                }
+              }
+            }
+          }
         })
         .catch(error => {
           console.error('Upload error:', error);
@@ -151,6 +213,7 @@ export default function AudioRecorderStream() {
           }
 
           setStatus(`❌ Error: ${errorMessage}`);
+          setUploadStatus(`❌ Error: ${errorMessage}`);
         });
 
       // 1초마다 청크 생성
@@ -212,11 +275,48 @@ export default function AudioRecorderStream() {
 
       <div className="w-full max-w-md">
         <div className="mb-2 text-sm text-gray-600">
-          <span className="font-semibold">Status:</span>
+          <span className="font-semibold">Recording Status:</span>
           <div className="mt-1 p-2 bg-gray-50 rounded text-xs break-words">
             {status}
           </div>
         </div>
+
+        {uploadStatus && (
+          <div className="mb-2 text-sm text-gray-600">
+            <span className="font-semibold">Upload Status:</span>
+            <div className="mt-1 p-2 bg-blue-50 rounded text-xs break-words">
+              {uploadStatus}
+            </div>
+          </div>
+        )}
+
+        {receivedChunks.length > 0 && (
+          <div className="mb-2 text-sm text-gray-600">
+            <span className="font-semibold">Server Response Stream:</span>
+            <div className="mt-1 p-2 bg-green-50 rounded text-xs max-h-40 overflow-y-auto">
+              {receivedChunks.map((chunk, index) => (
+                <div key={index} className="mb-1 font-mono">
+                  {chunk.type === 'chunk' && (
+                    <span className="text-green-700">
+                      ✓ Chunk {chunk.chunkIndex}: {chunk.bytes} bytes (total: {chunk.totalBytes})
+                    </span>
+                  )}
+                  {chunk.type === 'complete' && (
+                    <span className="text-blue-700 font-semibold">
+                      ✅ Complete - Session: {chunk.sessionId}, Total: {chunk.totalChunks} chunks
+                    </span>
+                  )}
+                  {chunk.type === 'error' && (
+                    <span className="text-red-700">
+                      ❌ Error: {chunk.error}
+                    </span>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
         {isRecording && (
           <div className="mt-4 flex items-center gap-2">
             <div className="w-3 h-3 bg-purple-500 rounded-full animate-pulse"></div>
