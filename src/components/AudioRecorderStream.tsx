@@ -23,6 +23,8 @@ export default function AudioRecorderStream() {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const streamControllerRef = useRef<ReadableStreamDefaultController | null>(null);
   const chunkBufferRef = useRef<Uint8Array[]>([]);
+  const eventSourceRef = useRef<EventSource | null>(null);
+  const sessionIdRef = useRef<string>('');
 
   // 브라우저가 ReadableStream body를 지원하는지 확인
   const checkSupport = async () => {
@@ -48,7 +50,50 @@ export default function AudioRecorderStream() {
     }
 
     try {
+      // 세션 ID 생성
+      sessionIdRef.current = `session_${Date.now()}`;
+
+      // SSE 연결 먼저 설정
+      setUploadStatus('Connecting to SSE...');
+      const eventSource = new EventSource(`/api/audio-progress?sessionId=${sessionIdRef.current}`);
+      eventSourceRef.current = eventSource;
+
+      eventSource.onopen = () => {
+        console.log('SSE connection opened');
+        setUploadStatus('SSE connected');
+      };
+
+      eventSource.onmessage = (event) => {
+        try {
+          const data: ResponseChunk = JSON.parse(event.data);
+          console.log('SSE message:', data);
+
+          setReceivedChunks(prev => [...prev, data]);
+
+          if (data.type === 'connected') {
+            setUploadStatus(`SSE connected: ${data.sessionId}`);
+          } else if (data.type === 'chunk') {
+            setUploadStatus(
+              `Received server response for chunk ${data.chunkIndex}: ${data.bytes} bytes (total: ${data.totalBytes} bytes)`
+            );
+          } else if (data.type === 'complete') {
+            setUploadStatus(`✅ Complete! Session: ${data.sessionId}, Total chunks: ${data.totalChunks}`);
+            setStatus(`✅ Upload complete! Session: ${data.sessionId}, Chunks: ${data.totalChunks}`);
+          } else if (data.type === 'error') {
+            setUploadStatus(`❌ Server error: ${data.error}`);
+          }
+        } catch (error) {
+          console.error('Error parsing SSE message:', error);
+        }
+      };
+
+      eventSource.onerror = (error) => {
+        console.error('SSE error:', error);
+        setUploadStatus('SSE connection error');
+      };
+
       setStatus('Requesting microphone access...');
+      setReceivedChunks([]);
       const mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
       // MediaRecorder 설정
@@ -129,76 +174,29 @@ export default function AudioRecorderStream() {
         setStatus(`Recording stopped. Total chunks processed: ${chunkCount}`);
       };
 
-      // Fetch로 스트림 전송 시작
+      // Fetch로 스트림 전송 시작 (진행 상황은 SSE로 받음)
       setStatus('Starting stream upload...');
-      setReceivedChunks([]);
-      setUploadStatus('Connecting to server...');
+      setUploadStatus('Uploading stream...');
 
       fetch('/api/audio-stream-readable', {
         method: 'POST',
         headers: {
           'Content-Type': 'audio/webm',
+          'X-Session-Id': sessionIdRef.current,
         },
         body: readableStream,
-        // @ts-ignore - duplex는 아직 TypeScript에서 완전히 지원되지 않음
+        // @ts-expect-error - duplex는 아직 TypeScript에서 완전히 지원되지 않음
         duplex: 'half',
       })
-        .then(async response => {
+        .then(response => {
+          console.log('Upload response:', response.status);
           if (!response.ok) {
             throw new Error(`HTTP ${response.status}: ${response.statusText}`);
           }
-
-          // 응답 스트림 읽기
-          const reader = response.body?.getReader();
-          if (!reader) {
-            throw new Error('No response stream');
-          }
-
-          const decoder = new TextDecoder();
-          let buffer = '';
-
-          setUploadStatus('Receiving response stream...');
-
-          while (true) {
-            const { done, value } = await reader.read();
-
-            if (done) {
-              console.log('Response stream complete');
-              setUploadStatus('Response stream closed');
-              break;
-            }
-
-            // 받은 데이터를 디코드하여 버퍼에 추가
-            buffer += decoder.decode(value, { stream: true });
-
-            // 줄바꿈으로 구분된 JSON 객체들을 파싱
-            const lines = buffer.split('\n');
-            // 마지막 요소는 불완전할 수 있으므로 버퍼에 유지
-            buffer = lines.pop() || '';
-
-            for (const line of lines) {
-              if (line.trim()) {
-                try {
-                  const data: ResponseChunk = JSON.parse(line);
-
-                  setReceivedChunks(prev => [...prev, data]);
-
-                  if (data.type === 'chunk') {
-                    setUploadStatus(
-                      `Received server response for chunk ${data.chunkIndex}: ${data.bytes} bytes (total: ${data.totalBytes} bytes)`
-                    );
-                  } else if (data.type === 'complete') {
-                    setUploadStatus(`✅ Complete! Session: ${data.sessionId}, Total chunks: ${data.totalChunks}`);
-                    setStatus(`✅ Upload complete! Session: ${data.sessionId}, Chunks: ${data.totalChunks}`);
-                  } else if (data.type === 'error') {
-                    setUploadStatus(`❌ Server error: ${data.error}`);
-                  }
-                } catch (error) {
-                  console.error('Error parsing response line:', line, error);
-                }
-              }
-            }
-          }
+          return response.json();
+        })
+        .then(data => {
+          console.log('Upload finished:', data);
         })
         .catch(error => {
           console.error('Upload error:', error);
@@ -206,9 +204,9 @@ export default function AudioRecorderStream() {
           // 특정 에러에 대한 사용자 친화적 메시지
           let errorMessage = error.message;
 
-          if (error.message.includes('ERR_ALPN_NEGOTIATION_FAILED')) {
+          if (error.message?.includes('ERR_ALPN_NEGOTIATION_FAILED')) {
             errorMessage = 'HTTP/2 not available. Please use Docker setup (docker-compose up) or use Method 1.';
-          } else if (error.message.includes('Failed to fetch')) {
+          } else if (error.message?.includes('Failed to fetch')) {
             errorMessage = 'Network error. Make sure you are using HTTPS (https://localhost) with Docker.';
           }
 
@@ -228,6 +226,12 @@ export default function AudioRecorderStream() {
   const stopRecording = () => {
     if (mediaRecorderRef.current && isRecording) {
       mediaRecorderRef.current.stop();
+    }
+
+    // SSE 연결 종료
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close();
+      eventSourceRef.current = null;
     }
   };
 
@@ -290,29 +294,38 @@ export default function AudioRecorderStream() {
           </div>
         )}
 
-        {receivedChunks.length > 0 && (
+        {(isRecording || receivedChunks.length > 0) && (
           <div className="mb-2 text-sm text-gray-600">
-            <span className="font-semibold">Server Response Stream:</span>
+            <span className="font-semibold">Server Response Stream (SSE):</span>
             <div className="mt-1 p-2 bg-green-50 rounded text-xs max-h-40 overflow-y-auto">
-              {receivedChunks.map((chunk, index) => (
-                <div key={index} className="mb-1 font-mono">
-                  {chunk.type === 'chunk' && (
-                    <span className="text-green-700">
-                      ✓ Chunk {chunk.chunkIndex}: {chunk.bytes} bytes (total: {chunk.totalBytes})
-                    </span>
-                  )}
-                  {chunk.type === 'complete' && (
-                    <span className="text-blue-700 font-semibold">
-                      ✅ Complete - Session: {chunk.sessionId}, Total: {chunk.totalChunks} chunks
-                    </span>
-                  )}
-                  {chunk.type === 'error' && (
-                    <span className="text-red-700">
-                      ❌ Error: {chunk.error}
-                    </span>
-                  )}
-                </div>
-              ))}
+              {receivedChunks.length === 0 ? (
+                <div className="text-gray-500 italic">Waiting for server response...</div>
+              ) : (
+                receivedChunks.map((chunk, index) => (
+                  <div key={index} className="mb-1 font-mono">
+                    {chunk.type === 'connected' && (
+                      <span className="text-blue-600">
+                        🔗 Connected - Session: {chunk.sessionId}
+                      </span>
+                    )}
+                    {chunk.type === 'chunk' && (
+                      <span className="text-green-700">
+                        ✓ Chunk {chunk.chunkIndex}: {chunk.bytes} bytes (total: {chunk.totalBytes})
+                      </span>
+                    )}
+                    {chunk.type === 'complete' && (
+                      <span className="text-blue-700 font-semibold">
+                        ✅ Complete - Session: {chunk.sessionId}, Total: {chunk.totalChunks} chunks
+                      </span>
+                    )}
+                    {chunk.type === 'error' && (
+                      <span className="text-red-700">
+                        ❌ Error: {chunk.error}
+                      </span>
+                    )}
+                  </div>
+                ))
+              )}
             </div>
           </div>
         )}
